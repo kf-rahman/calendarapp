@@ -1,6 +1,5 @@
 absl-py==2.1.0
 accelerate @ git+https://github.com/huggingface/accelerate@724824abbe0aed8606661bbce5e057c0d2447794
-alabaster @ file:///home/ktietz/src/ci/alabaster_1611921544520/work
 anaconda-client @ file:///opt/concourse/worker/volumes/live/866d4dd0-ff5b-4d0b-718d-0267a3b10e06/volume/anaconda-client_1635342573767/work
 anaconda-navigator==2.1.1
 anaconda-project @ file:///tmp/build/80754af9/anaconda-project_1626085644852/work
