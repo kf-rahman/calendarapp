@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, Body, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -8,6 +8,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
+import uuid
 
 # Import the LLM script
 from llm import extract_course_info
@@ -135,6 +136,7 @@ def home():
         </div>
         
         <button id="submitBtn" type="button">Extract & Create Events</button>
+        <button id="downloadIcsBtn" type="button" style="margin-left:10px;">Download ICS</button>
         
         <div class="loading" id="loadingIndicator">
           Processing your request... This may take a few seconds.
@@ -213,6 +215,53 @@ def home():
               document.getElementById('loadingIndicator').style.display = 'none';
             }
           });
+
+          document.getElementById('downloadIcsBtn').addEventListener('click', async function() {
+            const courseOutline = document.getElementById('course_outline').value;
+            
+            // Validation
+            if (!courseOutline) {
+              document.getElementById('errorMessage').textContent = 'Please enter your course outline';
+              document.getElementById('errorMessage').style.display = 'block';
+              return;
+            }
+            
+            // Show loading indicator
+            document.getElementById('loadingIndicator').style.display = 'block';
+            document.getElementById('errorMessage').style.display = 'none';
+            
+            try {
+              const response = await fetch('/generate-ics', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  course_outline: courseOutline
+                })
+              });
+              
+              if (!response.ok) {
+                const result = await response.json();
+                throw new Error(result.detail || 'Something went wrong');
+              }
+              
+              // Convert the response to blob and trigger download
+              const blob = await response.blob();
+              const url = window.URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'events.ics';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+            } catch (error) {
+              document.getElementById('errorMessage').textContent = error.message;
+              document.getElementById('errorMessage').style.display = 'block';
+            } finally {
+              document.getElementById('loadingIndicator').style.display = 'none';
+            }
+          });
         </script>
       </body>
     </html>
@@ -220,15 +269,15 @@ def home():
     return HTMLResponse(html_form)
 
 # ------------------------------------------------------------------------------
-#  EXTRACT & CREATE EVENTS ENDPOINT
+#  EXTRACT & CREATE EVENTS ENDPOINT (Google Calendar API approach)
 # ------------------------------------------------------------------------------
 @app.post("/extract-and-create-events")
 async def extract_and_create_events(request: Request):
     """
-    1) Takes 'course_outline' text and 'calendar_id' from user
-    2) Calls LLM to extract dates
-    3) Creates Google Calendar events in the specified calendar
-    4) Returns success message with event links
+    1) Takes 'course_outline' text and 'calendar_id' from user.
+    2) Calls LLM to extract dates.
+    3) Creates Google Calendar events in the specified calendar.
+    4) Returns success message with event links.
     """
     try:
         data = await request.json()
@@ -245,7 +294,6 @@ async def extract_and_create_events(request: Request):
         
         # 1️⃣ Call LLM to extract structured data
         llm_response = extract_course_info(course_outline)
-        
         try:
             parsed_data = json.loads(llm_response)  # Convert string to JSON
         except json.JSONDecodeError:
@@ -256,7 +304,7 @@ async def extract_and_create_events(request: Request):
         if not GOOGLE_API_KEY:
             raise HTTPException(status_code=500, detail="Google API key not configured")
             
-        # 2️⃣ Use Google API key instead of OAuth (for public calendar access)
+        # 2️⃣ Use Google API key (for public calendar access)
         try:
             service = build("calendar", "v3", developerKey=GOOGLE_API_KEY)
         except Exception as e:
@@ -278,9 +326,6 @@ async def extract_and_create_events(request: Request):
             if event:
                 creation_details.append(event)
         
-        # Add any schedule items as recurring events (optional extension)
-        # This could be implemented for regular class sessions
-                
         logger.info(f"Created {len(creation_details)} calendar events")
         
         return {
@@ -300,9 +345,8 @@ async def extract_and_create_events(request: Request):
 def create_calendar_event(service, item_dict, item_type: str, calendar_id: str):
     """
     Creates an event in the specified Google Calendar.
-    
     Example:
-    item_dict = { "name": "Midterm Exam", "due_date": "2025-10-10" }
+      item_dict = { "name": "Midterm Exam", "due_date": "2025-10-10" }
     """
     name = item_dict.get("name")
     due_date_str = item_dict.get("due_date")
@@ -353,5 +397,107 @@ def create_calendar_event(service, item_dict, item_type: str, calendar_id: str):
         return None
 
 # ------------------------------------------------------------------------------
-#  MAIN - For running with "python app.py"
+#  iCalendar (ICS) GENERATION FUNCTIONS & ENDPOINT
 # ------------------------------------------------------------------------------
+def create_ics_event(event: dict) -> str:
+    """
+    Generates a single ICS event string for an event dictionary.
+    The event dict should have keys: type, name, due_date, and optionally description.
+    """
+    uid = str(uuid.uuid4())
+    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # For all-day events, use date format YYYYMMDD
+    try:
+        dtstart = datetime.strptime(event["due_date"], "%Y-%m-%d").strftime("%Y%m%d")
+    except ValueError:
+        dtstart = ""
+    summary = f"{event.get('type', '')}: {event.get('name', '')}"
+    description = event.get("description", "")
+    ics_event = (
+        "BEGIN:VEVENT\n"
+        f"UID:{uid}\n"
+        f"DTSTAMP:{dtstamp}\n"
+        f"DTSTART;VALUE=DATE:{dtstart}\n"
+        f"DTEND;VALUE=DATE:{dtstart}\n"
+        f"SUMMARY:{summary}\n"
+        f"DESCRIPTION:{description}\n"
+        "END:VEVENT"
+    )
+    return ics_event
+
+def create_ics_calendar(events: list) -> str:
+    """
+    Combines multiple ICS events into a full calendar string.
+    """
+    header = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Course Calendar Assistant//EN"
+    footer = "END:VCALENDAR"
+    events_str = "\n".join(create_ics_event(event) for event in events)
+    return f"{header}\n{events_str}\n{footer}"
+
+@app.post("/generate-ics")
+async def generate_ics(request: Request):
+    """
+    1) Takes 'course_outline' text from user.
+    2) Calls LLM to extract events.
+    3) Generates an iCalendar (.ics) file with the events.
+    4) Returns the .ics file for download.
+    """
+    try:
+        data = await request.json()
+        course_outline = data.get("course_outline")
+        
+        if not course_outline:
+            raise HTTPException(status_code=400, detail="Missing course outline")
+        
+        logger.info(f"Generating ICS for course outline length: {len(course_outline)} characters")
+        
+        # Call LLM to extract structured data
+        llm_response = extract_course_info(course_outline)
+        try:
+            parsed_data = json.loads(llm_response)
+        except json.JSONDecodeError:
+            logger.error("Could not parse LLM response as valid JSON")
+            raise HTTPException(status_code=400, detail="Invalid LLM response format")
+        
+        # Combine events from exams and assignments
+        events = []
+        for exam in parsed_data.get("exams", []):
+            if exam.get("name") and exam.get("due_date"):
+                events.append({
+                    "type": "Exam",
+                    "name": exam.get("name"),
+                    "due_date": exam.get("due_date"),
+                    "description": exam.get("description", "")
+                })
+        for assignment in parsed_data.get("assignments", []):
+            if assignment.get("name") and assignment.get("due_date"):
+                events.append({
+                    "type": "Assignment",
+                    "name": assignment.get("name"),
+                    "due_date": assignment.get("due_date"),
+                    "description": assignment.get("description", "")
+                })
+                
+        ics_content = create_ics_calendar(events)
+        
+        return Response(
+            content=ics_content,
+            media_type="text/calendar",
+            headers={"Content-Disposition": "attachment; filename=events.ics"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in generate_ics: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+# ------------------------------------------------------------------------------
+#  STATIC FILES & TEMPLATES
+
+
+# ------------------------------------------------------------------------------
+#  MAIN - For running with "python main.py"
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
